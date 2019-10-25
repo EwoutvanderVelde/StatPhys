@@ -1,0 +1,266 @@
+# -*- coding: utf-8 -*-
+"""
+Spyder Editor
+
+This is a temporary script file.
+"""
+
+from __future__ import division, unicode_literals, print_function
+import scipy.odr as odr
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from pandas import DataFrame, Series
+import pims
+import trackpy as tp
+from uncertainties import ufloat
+
+
+# Elkele waarden die door het hele script worden gebruikt.
+T = ufloat(294,1)   # Temperatuur in K tijdens het meten
+eta = 0.001         # De viscositeit van water in Pa*s
+
+# de stalen van de verschillende deeltjes die we onderzoeken
+a1 = ufloat(1.93E-6, 0.054E-6)
+a2 = ufloat(9.9E-7, 0.3E-7)
+a3 = ufloat(7.46E-7, 0.22E-7)
+
+# De omrekenwaarde in meter per pixel per vergroting
+Convert10 = 7.4828E-7 #10x
+Convert40 = 1.9029E-7 #40x
+Convert90 = 8.4616E-8 #90x
+
+
+# Openen van een bestand om tussenwaarden in op te slaan voor het artikel
+file = open('Data.txt', 'w')
+
+# 2 lege lijsten om later waarden voor k_B en zijn onzekerheid in op te slaan
+kb_lijst = []
+kb_onzerkheid = []
+
+
+# De volgende plot moet voor de functie k_B geopend worden. Wanneer dit later
+# gebeurdt herkent de functie deze niet tijden het plotten.
+f,ax1 = plt.subplots(figsize=(8,5))
+ax1.set_xlabel("$t$(s)", fontsize = 18)
+ax1.set_ylabel("$\\bar{R^2}(m)$", fontsize = 18)
+
+
+# Deze functie vindt de k_B per meting
+# Hiervoor moet de straal 'a' van het deeltje, een schaal 'Convert' van de video, minmass
+# voor TrackPy, een bestandsnaam en een losse naam voor de plot opgegeven worden.
+def k_B(a, Convert, minmass ,filename, naam):
+    
+    frames = pims.TiffStack(filename, as_grey = False)                # Inladen van de Tiffstack
+    f = tp.locate(frames, 21, invert=True, minmass=minmass)       # Per frame de deeltjes vinnden
+    
+    f = tp.batch(frames[-150:], 21, minmass=minmass, invert=True)
+    t = tp.link_df(f, 5, memory=3)
+    
+    t1 = tp.filter_stubs(t, 25)
+    
+    d = tp.compute_drift(t1) 
+    tm = tp.subtract_drift(t1.copy(),d)     
+    
+    # 'Convert' is de schaal voor hetomrekenen van pixels naar m, frames per second = 15  
+    em = tp.emsd(tm, Convert, 15) 
+      
+           
+    """
+    # Dit deel van de code staat nu een annotatie. Dit deel werd gebruikt om te kijken
+    # of de ODR fit die volgt, vergelijkbare resultaten gaf met de ingebouwde fit 
+    # van TrackPy. Dit bleek te verschillen, en aangezien ODR onzekerheid mee kan rekenen
+    # rekenen we verder met ODR 
+    
+    atre = tp.utils.fit_powerlaw(em)  # performs linear best fit in log space, plots
+    
+    # Aangezien we niet veel ervaring met pandas hebben gewerkt hiervoor,
+    # hebben we besloten het dataframe om te zetten naar een numpy array
+    atre_matrix = atre.as_matrix()
+    
+    Kb = ( (atre_matrix[0,1]) * (6*np.pi*eta*a) ) / (4*T)
+    print("----TrackPy fit k_B: \n",Kb,"\n")
+    """
+    
+    
+    
+    """
+    Aangezien TrackPy geen onzekerheden kan bepalen, moeten we deze zelf gaan
+    bepalen. Dit zullen we nu gaan doen.
+    """
+    R2_List = []
+    
+    # herhalen voor elk uniek deeltje
+    for particle in tm.particle.unique():
+        
+        # elk deeltje stuk voor stuk langs gaan
+        temp_tm = tm[tm['particle'] == particle]
+        for i in range(temp_tm.shape[0]-1):
+            
+            # kijken of het zelfde deeltje in het volgende frame nog bestaat
+            if temp_tm.iloc[i+1]['frame'] == temp_tm.iloc[i]['frame'] + 1:
+                
+                # berekenen van r2
+                x1 = temp_tm.iloc[i+1]['x']
+                x2 = temp_tm.iloc[i]['x']
+                
+                y1 = temp_tm.iloc[i+1]['y']
+                y2 = temp_tm.iloc[i]['y']
+                
+                dx = x1 - x2
+                dy = y1 - y2
+                
+                r2 = dx**2 + dy**2
+                R2_List.append(r2)
+    
+    # We zetten de lijst om naar een numpy array. Dit is voor eigen gemak. 
+    R2_List = np.array(R2_List)
+    R2_List = R2_List*(Convert)    
+            
+    stdev = np.std(R2_List, ddof = 1)
+    
+    # ------------------------------- ODR -------------------------------------
+    print("-----------------ODR-----------------\n")
+    
+    
+    r2 = em.values
+    t = em.index.values
+    
+    y = r2
+    x = t
+    sigy = stdev**2
+    sigy_arr = np.array([sigy for i in range(len(y))])
+    
+    ax1.errorbar(x = x,
+                y = y,
+                yerr = sigy_arr,
+                fmt='.',
+                label='$\\bar{R^2}$ meting %d'%(naam))
+    
+    
+    # De onderstaande functie volg de formule R2 = A * t^n zoals in de theory beschreven.
+
+    def f(B, x):
+        return B[0]*(x)**B[1]
+    
+    A = 1
+    n = 1
+    
+    # C=Vervolgens gebruiken we odr om te fitten door de datapunten
+    odr_model = odr.Model(f)
+    odr_data  = odr.RealData(x,y,sy=sigy_arr)          
+    odr_obj   = odr.ODR(odr_data,odr_model,beta0=[A,n])
+    odr_obj.set_job(fit_type=2)                     
+    odr_res   = odr_obj.run()                       
+    
+    par_best = odr_res.beta                         
+    par_sig_ext = odr_res.sd_beta                   
+    chi2red = odr_res.res_var
+    
+    print("t = {:.3} ± {:.3}".format(par_best[1], par_sig_ext[1]))
+    print("A = {:.3} ± {:.3}".format(par_best[0], par_sig_ext[0]))
+    print("Reduced chi-squared = {:.3f}".format(chi2red))
+    
+    # Hier plotten we ter controle de aanpassing met de dataset
+    xplot=np.linspace(0, np.max(x), num=10000)
+    ax1.plot(xplot, f(par_best, xplot),label = 'fit bij meting %d'%(naam))
+    
+    # De gevonden fitparameter met onzekerheid toewijzen aan ufloat variabelen
+    A = ufloat(par_best[0], par_sig_ext[0])
+    n = ufloat(par_best[1], par_sig_ext[1])
+    Kb = ((A) * (6*np.pi*eta*a) ) / (4*T)
+    print("--------------------------------------------------------\n",Kb,"\n")
+    
+    # We schrijven de gevonden waarden ook weg naar een bestand.
+    # Dit doen we omdat TrackPy veel in de console dumpt, waardoor we deze niet
+    # altijd kunnen terugvinden.    
+    file.write('{}\t{}\t{}\t{}\t{}\n'.format(naam ,Kb, A, n, chi2red))    
+    
+    # We schrijven de gevonden waarden ook in een lijst. Dit is makkelijker
+    # om later terug te roepen voor controle en/of verdere verwerking 
+    kb_lijst.append(Kb.n)
+    kb_onzerkheid.append(Kb.s)
+    
+    return
+
+
+
+# We zoeken de k_B van meerdere videometingen met behulp van de k_B() functie. 
+k_B(a2, Convert40, 900, '1mim_40x_1perc_3.tif', 1)
+k_B(a3, Convert40, 700, '075mim_40x_1perc_2.tif', 2)
+k_B(a3, Convert40, 730, '075mim_40x_1perc.tif', 3)
+k_B(a1, Convert40, 900, '2mim_40x_10perc_3.tif', 4)
+
+# Afsluiten van de plot
+ax1.legend()
+plt.savefig("Tussenstap.pdf")
+
+
+
+"""
+-------------------------------------------------------------------------------
+Vanaf hier zullen we de gemiddelde gevonden waarde van k_B vinden. Deze zal
+bepaald worden met behulp van ODR
+
+"""
+
+
+y = kb_lijst
+sigy = kb_onzerkheid
+x1 = np.arange(1,(len(y)+1))    
+
+f,ax = plt.subplots(figsize=(8,5))
+ax.set_xlabel("Meting", fontsize = 18)
+ax.set_ylabel("$k_B (JK^{-1})$", fontsize = 16)
+ax.errorbar(x = x1,
+            y = y,
+            yerr = sigy,
+            fmt="k.",
+            label="Meting")
+
+# We maken een lijst met nullen aan voor de x waarden. 
+# Hierdoor kunnen we er voor zorgen dat we een constante waarde kunnen vinden
+# in de fit
+x = np.zeros(len(y))
+
+# Aangezien de waarde van x nul is, fitten we aan k_B = C
+def f(B, x):
+    return x + B[0]
+C = 1
+
+"""
+Aangezien we odr al eerder hebben uitgelegt, zullen wij dit hier niet nog eens doen
+"""
+odr_model = odr.Model(f)
+odr_data  = odr.RealData(x,y,sy=sigy)          
+odr_obj   = odr.ODR(odr_data,odr_model,beta0=[C])
+odr_obj.set_job(fit_type=2)                     
+odr_res   = odr_obj.run()                       
+
+par_best = odr_res.beta                         
+par_sig_ext = odr_res.sd_beta                   
+chi2red = odr_res.res_var
+
+# plotten om te controlleren
+ax.plot(x1,x+par_best[0], color='r', label = '$\\bar{k_B}$')
+ax.fill_between(x = x1, 
+                y1 = x+par_best[0]-par_sig_ext[0], 
+                y2 = x+par_best[0]+par_sig_ext[0], 
+                facecolor='blue', 
+                alpha=0.5,
+                label='$\\sigma_{\\bar{k_B}}$')
+ax.xaxis.set_ticks(np.arange(1, (len(x)+1), 1))
+ax.legend(fontsize=15, loc=4)
+plt.savefig('eindresultaat.pdf')
+
+# Wederom schrijven we deze resultaten ook naar een bestand om later
+# weer terug te kunnen lezen
+file.write('{}\t{}\t{}'.format(par_best[0], par_sig_ext[0], chi2red))    
+
+# Sluiten van het bestand
+file.close()
+
+# De resultaten printen in de console
+print("Kb = {:.3} ± {:.3}".format(par_best[0], par_sig_ext[0]))
+print("Reduced chi-squared = {:.3f}".format(chi2red))
